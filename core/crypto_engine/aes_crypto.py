@@ -1,41 +1,51 @@
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
+"""
+AES symmetric encryption — GCM (authenticated) and CBC modes.
+"""
+
 import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as sym_padding
+
 
 class AESCrypto:
+    """AES-256 encryption helper (GCM & CBC)."""
 
-    def encrypt(self, plaintext: bytes, key: bytes):
-        iv = os.urandom(16)
+    def __init__(self, key: bytes | None = None, key_size: int = 32):
+        self.key = key if key else os.urandom(key_size)
 
-        padder = padding.PKCS7(128).padder()
-        padded_data = padder.update(plaintext) + padder.finalize()
+    # ── AES-GCM (recommended) ───────────────────────────────────
+    def encrypt_gcm(self, plaintext: bytes,
+                    associated_data: bytes | None = None) -> tuple[bytes, bytes]:
+        """Return *(nonce, ciphertext+tag)*."""
+        nonce  = os.urandom(12)
+        aesgcm = AESGCM(self.key)
+        ct     = aesgcm.encrypt(nonce, plaintext, associated_data)
+        return nonce, ct
 
-        cipher = Cipher(
-            algorithms.AES(key),
-            modes.CBC(iv),
-            backend=default_backend()
-        )
+    def decrypt_gcm(self, nonce: bytes, ciphertext: bytes,
+                    associated_data: bytes | None = None) -> bytes:
+        aesgcm = AESGCM(self.key)
+        return aesgcm.decrypt(nonce, ciphertext, associated_data)
 
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+    # ── AES-CBC + PKCS-7 ────────────────────────────────────────
+    def encrypt_cbc(self, plaintext: bytes) -> tuple[bytes, bytes]:
+        """Return *(iv, ciphertext)*."""
+        iv      = os.urandom(16)
+        padder  = sym_padding.PKCS7(128).padder()
+        padded  = padder.update(plaintext) + padder.finalize()
+        cipher  = Cipher(algorithms.AES(self.key), modes.CBC(iv))
+        enc     = cipher.encryptor()
+        ct      = enc.update(padded) + enc.finalize()
+        return iv, ct
 
-        return iv + ciphertext
+    def decrypt_cbc(self, iv: bytes, ciphertext: bytes) -> bytes:
+        cipher   = Cipher(algorithms.AES(self.key), modes.CBC(iv))
+        dec      = cipher.decryptor()
+        padded   = dec.update(ciphertext) + dec.finalize()
+        unpadder = sym_padding.PKCS7(128).unpadder()
+        return unpadder.update(padded) + unpadder.finalize()
 
-    def decrypt(self, ciphertext: bytes, key: bytes):
-        iv = ciphertext[:16]
-        data = ciphertext[16:]
-
-        cipher = Cipher(
-            algorithms.AES(key),
-            modes.CBC(iv),
-            backend=default_backend()
-        )
-
-        decryptor = cipher.decryptor()
-        padded_plaintext = decryptor.update(data) + decryptor.finalize()
-
-        unpadder = padding.PKCS7(128).unpadder()
-        plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
-
-        return plaintext
+    # ── helpers ──────────────────────────────────────────────────
+    def get_key(self) -> bytes:
+        return self.key
