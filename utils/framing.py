@@ -11,12 +11,21 @@ import struct
 
 
 class MessageType:
+    # ── Existing (tunnel/proxy) ─────────────────────────────────
     HANDSHAKE_HELLO    = 0x01
     HANDSHAKE_RESPONSE = 0x02
     HANDSHAKE_FINISH   = 0x03
     DATA               = 0x10
     KEEPALIVE          = 0x20
     CLOSE              = 0xFF
+
+    # ── New: Relay / E2E messaging ──────────────────────────────
+    RELAY              = 0x30    # relay control messages (JSON)
+    PEER_MESSAGE       = 0x31   # E2E encrypted peer message
+    FILE_META          = 0x40   # file transfer metadata
+    FILE_CHUNK         = 0x41   # encrypted file chunk
+    FILE_COMPLETE      = 0x42   # file transfer complete signal
+    FILE_ACK           = 0x43   # file receipt acknowledgment
 
 
 class Framing:
@@ -39,7 +48,6 @@ class Framing:
 
     @staticmethod
     def _recv_exact(sock, n: int) -> bytes:
-        """Read exactly *n* bytes from *sock*."""
         buf = bytearray()
         while len(buf) < n:
             chunk = sock.recv(n - len(buf))
@@ -50,7 +58,6 @@ class Framing:
 
     @staticmethod
     def recv_frame(sock) -> tuple[int, bytes]:
-        """Return *(msg_type, payload)*."""
         header            = Framing._recv_exact(sock, Framing.HEADER_SIZE)
         length, msg_type  = Framing.parse_header(header)
         payload           = Framing._recv_exact(sock, length) if length else b""
