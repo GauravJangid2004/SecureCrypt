@@ -1,2 +1,4 @@
 cryptography>=41.0.0
 PyQt6>=6.5.0
+pytest>=7.4.0
+qrcode[pil]>=8.2.0

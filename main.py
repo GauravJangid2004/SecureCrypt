@@ -22,7 +22,7 @@ import socket as _socket
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QTabWidget,
+    QApplication, QMainWindow, QDialog, QWidget, QTabWidget,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QComboBox,
     QGroupBox, QSpinBox, QFileDialog, QMessageBox,
@@ -51,7 +51,8 @@ from traffic.relay_server import RelayServer
 from traffic.peer_client import PeerClient
 from core.e2e_engine import E2EEngine
 from core.file_transfer import FileMetadata
-
+from auth.login_system import ZeroTrustLoginManager
+from auth.login_gui import LoginDialog
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -1132,6 +1133,16 @@ class ProxyTab(QWidget):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class E2EMessagingTab(QWidget):
+    connect_finished = pyqtSignal(bool, str)
+    peer_list_signal = pyqtSignal(list)
+    e2e_signal = pyqtSignal(str, dict)
+    message_signal = pyqtSignal(str, str, bool, float, str)
+    file_start_signal = pyqtSignal(str, dict)
+    file_progress_signal = pyqtSignal(str, float)
+    file_complete_signal = pyqtSignal(str, dict)
+    status_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
     def __init__(self, bridge: SignalBridge, parent=None):
         super().__init__(parent)
         self.bridge = bridge
@@ -1140,6 +1151,16 @@ class E2EMessagingTab(QWidget):
         self._peer_list: list[dict] = []
         self._peer_refresh_timer = QTimer(self)
         self._peer_refresh_timer.timeout.connect(self._refresh_peers)
+
+        self.connect_finished.connect(self._on_connect_finished)
+        self.peer_list_signal.connect(self._cb_peers)
+        self.e2e_signal.connect(self._cb_e2e)
+        self.message_signal.connect(self._cb_message)
+        self.file_start_signal.connect(self._cb_file_start)
+        self.file_progress_signal.connect(self._cb_file_progress)
+        self.file_complete_signal.connect(self._cb_file_complete)
+        self.status_signal.connect(lambda msg: self.bridge.status_update.emit(msg))
+        self.error_signal.connect(lambda msg: self.bridge.status_update.emit(f"⚠ {msg}"))
 
         # Chat + file panel uses a splitter — not a scroll area — so text areas grow naturally
         outer = QVBoxLayout(self)
@@ -1324,26 +1345,37 @@ class E2EMessagingTab(QWidget):
         def _do():
             self.peer_client = PeerClient(
                 username=username, relay_host=relay_host, relay_port=relay_port,
-                on_message_received=self._cb_message,
-                on_file_started=self._cb_file_start, on_file_progress=self._cb_file_progress,
-                on_file_complete=self._cb_file_complete, on_peer_list=self._cb_peers,
-                on_e2e_established=self._cb_e2e,
-                on_status=lambda m: self.bridge.status_update.emit(m),
-                on_error=lambda m: self.bridge.status_update.emit(f"⚠ {m}"),
+                on_message_received=self.message_signal.emit,
+                on_file_started=self.file_start_signal.emit,
+                on_file_progress=self.file_progress_signal.emit,
+                on_file_complete=self.file_complete_signal.emit,
+                on_peer_list=self.peer_list_signal.emit,
+                on_e2e_established=self.e2e_signal.emit,
+                on_status=self.status_signal.emit,
+                on_error=self.error_signal.emit,
             )
-            if self.peer_client.connect():
-                self.lbl_conn_status.setText(f"● Connected as '{username}' → {relay_host}:{relay_port}")
-                self.lbl_conn_status.setStyleSheet("color:#a6e3a1;")
-                self.bridge.status_update.emit(f"Registered as '{username}' on {relay_host}:{relay_port}")
-                QTimer.singleShot(1500, self._update_identity)
-                QTimer.singleShot(3000, self._refresh_peers)
-                self._peer_refresh_timer.start(10_000)
-            else:
-                self.lbl_conn_status.setText(f"● Failed — {relay_host}:{relay_port}")
-                self.lbl_conn_status.setStyleSheet("color:#f38ba8;")
-                self.btn_connect.setEnabled(True); self.btn_disconnect.setEnabled(False)
+            connected = self.peer_client.connect()
+            self.connect_finished.emit(connected, relay_host)
         threading.Thread(target=_do, daemon=True).start()
         self.btn_connect.setEnabled(False); self.btn_disconnect.setEnabled(True)
+
+    def _on_connect_finished(self, success: bool, relay_host: str):
+        if success:
+            self.lbl_conn_status.setText(
+                f"● Connected as '{self.txt_username.text().strip()}' → {relay_host}:{self.spn_relay_port.value()}"
+            )
+            self.lbl_conn_status.setStyleSheet("color:#a6e3a1;")
+            self.bridge.status_update.emit(
+                f"Registered as '{self.txt_username.text().strip()}' on {relay_host}:{self.spn_relay_port.value()}"
+            )
+            QTimer.singleShot(1500, self._update_identity)
+            QTimer.singleShot(3000, self._refresh_peers)
+            self._peer_refresh_timer.start(10_000)
+        else:
+            self.lbl_conn_status.setText(f"● Failed — {relay_host}:{self.spn_relay_port.value()}")
+            self.lbl_conn_status.setStyleSheet("color:#f38ba8;")
+            self.btn_connect.setEnabled(True)
+            self.btn_disconnect.setEnabled(False)
 
     def _update_identity(self):
         if self.peer_client and self.peer_client.identity_info:
@@ -1803,12 +1835,482 @@ def _fmt_bytes(n: int) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Tab 9 — User Management & Account Settings
+# ──────────────────────────────────────────────────────────────────────────────
+
+class UserManagementTab(QWidget):
+    def __init__(self, bridge: SignalBridge, parent=None):
+        super().__init__(parent)
+        self.bridge = bridge
+        self.auth_manager = None
+        self.session_token = None
+        self.current_username = None
+        self.current_role = None
+        self.logger = logging.getLogger("SecureCrypt.UserMgmt")
+        
+        self._inner_widget = QWidget()
+        self._build_ui(self._inner_widget)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(make_scroll(self._inner_widget))
+
+    def _build_ui(self, parent: QWidget):
+        layout = QVBoxLayout(parent)
+        layout.setSpacing(14)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Your Account Section
+        layout.addWidget(section_label("👤 Your Account"))
+        self._build_account_section(layout)
+
+        # Admin Section (only for admins)
+        self.admin_section = QWidget()
+        admin_layout = QVBoxLayout(self.admin_section)
+        admin_layout.addWidget(section_label("⚙ User Management (Admin Only)"))
+        self._build_admin_section(admin_layout)
+        layout.addWidget(self.admin_section)
+        
+        layout.addStretch()
+
+    def _build_account_section(self, parent_layout: QVBoxLayout):
+        """Build user account section (visible to all)"""
+        account_group = QGroupBox()
+        account_layout = QVBoxLayout(account_group)
+        account_layout.setSpacing(12)
+
+        # Current account info
+        info_layout = QFormLayout()
+        info_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.lbl_username = QLabel("—")
+        self.lbl_role = QLabel("—")
+        info_layout.addRow("Username:", self.lbl_username)
+        info_layout.addRow("Role:", self.lbl_role)
+        account_layout.addLayout(info_layout)
+
+        account_layout.addSpacing(10)
+
+        # TOTP Secret Display
+        totp_group = QGroupBox("🔐 Your TOTP Secret (for Google Authenticator)")
+        totp_layout = QVBoxLayout(totp_group)
+        totp_layout.setSpacing(8)
+
+        self.txt_totp_base32 = QLineEdit()
+        self.txt_totp_base32.setReadOnly(True)
+        self.txt_totp_base32.setPlaceholderText("Click 'Show My TOTP Secret' to display")
+        totp_layout.addWidget(self.txt_totp_base32)
+
+        totp_btn_layout = QHBoxLayout()
+        self.btn_show_totp = QPushButton("🔓 Show My TOTP Secret")
+        self.btn_show_totp.setProperty("role", "primary")
+        self.btn_copy_totp = QPushButton("📋 Copy")
+        self.btn_copy_totp.setEnabled(False)
+        self.btn_show_totp.clicked.connect(self._show_my_totp)
+        self.btn_copy_totp.clicked.connect(lambda: QApplication.clipboard().setText(self.txt_totp_base32.text()))
+        totp_btn_layout.addWidget(self.btn_show_totp)
+        totp_btn_layout.addWidget(self.btn_copy_totp)
+        totp_btn_layout.addStretch()
+        totp_layout.addLayout(totp_btn_layout)
+
+        account_layout.addWidget(totp_group)
+
+        account_layout.addSpacing(10)
+
+        # Password Change
+        pwd_group = QGroupBox("🔑 Change Password")
+        pwd_layout = QVBoxLayout(pwd_group)
+        pwd_layout.setSpacing(8)
+
+        pwd_form = QFormLayout()
+        pwd_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.txt_old_pwd = QLineEdit()
+        self.txt_old_pwd.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_new_pwd = QLineEdit()
+        self.txt_new_pwd.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_new_pwd_confirm = QLineEdit()
+        self.txt_new_pwd_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+        
+        pwd_form.addRow("Current Password:", self.txt_old_pwd)
+        pwd_form.addRow("New Password:", self.txt_new_pwd)
+        pwd_form.addRow("Confirm New:", self.txt_new_pwd_confirm)
+        pwd_layout.addLayout(pwd_form)
+
+        pwd_info = QLabel("Password must be 12+ chars with uppercase, lowercase, numbers, and symbols")
+        pwd_info.setStyleSheet("color:#6c7086; font-size:11px;")
+        pwd_layout.addWidget(pwd_info)
+
+        pwd_btn_layout = QHBoxLayout()
+        self.btn_change_pwd = QPushButton("🔄 Change Password")
+        self.btn_change_pwd.setProperty("role", "primary")
+        self.btn_change_pwd.clicked.connect(self._change_password)
+        pwd_btn_layout.addWidget(self.btn_change_pwd)
+        pwd_btn_layout.addStretch()
+        pwd_layout.addLayout(pwd_btn_layout)
+
+        account_layout.addWidget(pwd_group)
+        
+        # Store references to prevent garbage collection
+        self._account_group = account_group
+        self._account_layout = account_layout
+        parent_layout.addWidget(account_group)
+
+    def _build_admin_section(self, parent_layout: QVBoxLayout):
+        """Build admin user management section (admin only)"""
+        # Create/Add User
+        add_group = QGroupBox("➕ Add New User")
+        add_layout = QVBoxLayout(add_group)
+        add_layout.setSpacing(8)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.txt_new_username = QLineEdit()
+        self.txt_new_password = QLineEdit()
+        self.txt_new_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.cmb_new_role = QComboBox()
+        self.cmb_new_role.addItems(["user", "admin"])
+
+        form.addRow("Username:", self.txt_new_username)
+        form.addRow("Password:", self.txt_new_password)
+        form.addRow("Role:", self.cmb_new_role)
+        add_layout.addLayout(form)
+
+        add_btn_layout = QHBoxLayout()
+        self.btn_add_user = QPushButton("➕ Create User")
+        self.btn_add_user.setProperty("role", "success")
+        self.btn_add_user.clicked.connect(self._add_new_user)
+        add_btn_layout.addWidget(self.btn_add_user)
+        add_btn_layout.addStretch()
+        add_layout.addLayout(add_btn_layout)
+
+        parent_layout.addWidget(add_group)
+
+        # User List
+        list_group = QGroupBox("👥 All Users")
+        list_layout = QVBoxLayout(list_group)
+        list_layout.setSpacing(8)
+
+        self.btn_refresh_users = QPushButton("🔄 Refresh Users")
+        self.btn_refresh_users.clicked.connect(self._refresh_user_list)
+        list_layout.addWidget(self.btn_refresh_users)
+
+        self.tbl_users = QTableWidget(0, 6)
+        self.tbl_users.setHorizontalHeaderLabels([
+            "Username", "Role", "Status", "Last Login", "Locked", "Actions"
+        ])
+        
+        # Configure column resize modes
+        header = self.tbl_users.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Username
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)  # Role
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Status
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)           # Last Login
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)  # Locked
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)  # Actions
+        
+        self.tbl_users.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl_users.setAlternatingRowColors(True)
+        self.tbl_users.setMinimumHeight(300)
+        self.tbl_users.verticalHeader().setVisible(False)
+        self.tbl_users.verticalHeader().setDefaultSectionSize(50)
+        list_layout.addWidget(self.tbl_users)
+
+        parent_layout.addWidget(list_group)
+
+    def set_auth_context(self, auth_manager, session_token, username, role):
+        """Set authentication context for this tab"""
+        self.auth_manager = auth_manager
+        self.session_token = session_token
+        self.current_username = username
+        self.current_role = role
+
+        # Update UI based on role
+        self.lbl_username.setText(username)
+        self.lbl_role.setText(f"{role.upper()}")
+
+        # Show/hide admin section
+        is_admin = (role == "admin")
+        self.admin_section.setVisible(is_admin)
+
+        # Refresh user list if admin
+        if is_admin:
+            self._refresh_user_list()
+
+        # Load user's own TOTP (for display purposes on request)
+        self.txt_totp_base32.clear()
+        self.txt_totp_base32.setPlaceholderText("Click 'Show My TOTP Secret' to display")
+
+    def _show_my_totp(self):
+        """Show user's own TOTP secret"""
+        if not self.auth_manager or not self.session_token:
+            QMessageBox.warning(self, "Error", "Not authenticated")
+            return
+
+        try:
+            result = self.auth_manager.get_user_totp_secret(
+                self.session_token, self.current_username
+            )
+            if not result:
+                QMessageBox.warning(self, "Error", "Could not retrieve TOTP secret")
+                return
+
+            hex_secret, base32_secret = result
+            self.txt_totp_base32.setText(base32_secret)
+            self.btn_copy_totp.setEnabled(True)
+            QMessageBox.information(
+                self, "✅ TOTP Secret",
+                f"Base32 Secret: {base32_secret}\n\n"
+                f"Add this to Google Authenticator:\n"
+                f"1. Tap '+' → 'Enter a setup key'\n"
+                f"2. Paste this secret\n"
+                f"3. Set type to 'Time based'\n"
+                f"4. Trust this device"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to retrieve TOTP: {e}")
+
+    def _change_password(self):
+        """Change user's password"""
+        if not self.auth_manager or not self.session_token:
+            QMessageBox.warning(self, "Error", "Not authenticated")
+            return
+
+        old_pwd = self.txt_old_pwd.text()
+        new_pwd = self.txt_new_pwd.text()
+        confirm = self.txt_new_pwd_confirm.text()
+
+        if not old_pwd:
+            QMessageBox.warning(self, "Error", "Enter current password")
+            return
+
+        if not new_pwd:
+            QMessageBox.warning(self, "Error", "Enter new password")
+            return
+
+        if new_pwd != confirm:
+            QMessageBox.warning(self, "Error", "Passwords don't match")
+            return
+
+        if len(new_pwd) < 12:
+            QMessageBox.warning(self, "Error", "Password must be 12+ characters")
+            return
+
+        try:
+            success = self.auth_manager.change_password(
+                self.session_token, old_pwd, new_pwd, ip="127.0.0.1"
+            )
+            if success:
+                QMessageBox.information(
+                    self, "✅ Success",
+                    "Password changed!\n\n"
+                    "You have been logged out.\n"
+                    "Please log in again with your new password."
+                )
+                # Clear form
+                self.txt_old_pwd.clear()
+                self.txt_new_pwd.clear()
+                self.txt_new_pwd_confirm.clear()
+            else:
+                QMessageBox.warning(self, "Error", "Password change failed.\n\nCheck your current password.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def _add_new_user(self):
+        """Admin: Add new user"""
+        if not self.auth_manager or self.current_role != "admin":
+            QMessageBox.warning(self, "Error", "Only admins can add users")
+            return
+
+        username = self.txt_new_username.text().strip()
+        password = self.txt_new_password.text()
+        role = self.cmb_new_role.currentText()
+
+        if not username:
+            QMessageBox.warning(self, "Error", "Enter username")
+            return
+
+        if not password:
+            QMessageBox.warning(self, "Error", "Enter password")
+            return
+
+        if len(password) < 12:
+            QMessageBox.warning(self, "Error", "Password must be 12+ characters")
+            return
+
+        try:
+            from auth.login_system import TOTP, format_totp_display
+            totp_secret = self.auth_manager.register_user(username, password, role=role)
+            base32 = format_totp_display(totp_secret)
+
+            QMessageBox.information(
+                self, "✅ User Created",
+                f"User '{username}' created successfully!\n\n"
+                f"📱 Base32 TOTP Secret:\n{base32}\n\n"
+                f"Share this with the user so they can add to Google Authenticator"
+            )
+
+            # Clear form
+            self.txt_new_username.clear()
+            self.txt_new_password.clear()
+            self.cmb_new_role.setCurrentText("user")
+
+            # Refresh user list
+            self._refresh_user_list()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create user: {e}")
+
+    def _refresh_user_list(self):
+        """Admin: Refresh user list"""
+        if not self.auth_manager or self.current_role != "admin":
+            return
+
+        try:
+            users = self.auth_manager.get_all_users()
+            self.tbl_users.setRowCount(len(users))
+            self.tbl_users.setRowHeight(0, 50)  # Set consistent row height
+
+            for row, user in enumerate(users):
+                self.tbl_users.setItem(row, 0, QTableWidgetItem(user["username"]))
+                self.tbl_users.setItem(row, 1, QTableWidgetItem(user["role"].upper()))
+
+                # Status
+                status = "🟢 Active" if user["active"] else "🔴 Disabled"
+                self.tbl_users.setItem(row, 2, QTableWidgetItem(status))
+
+                # Last Login
+                last_login = "Never" if user.get("last_login", 0) == 0 else \
+                            datetime.fromtimestamp(user.get("last_login", 0)).strftime("%Y-%m-%d %H:%M:%S")
+                self.tbl_users.setItem(row, 3, QTableWidgetItem(last_login))
+
+                # Locked Status
+                locked = "🔒 Locked" if user.get("locked", False) else "🔓 Free"
+                self.tbl_users.setItem(row, 4, QTableWidgetItem(locked))
+
+                # Actions - Create compact button layout
+                actions_widget = QWidget()
+                actions_layout = QHBoxLayout(actions_widget)
+                actions_layout.setContentsMargins(4, 4, 4, 4)
+                actions_layout.setSpacing(6)
+
+                btn_totp = QPushButton("🔐 TOTP")
+                btn_totp.setMaximumWidth(100)
+                btn_totp.setMinimumHeight(32)
+                btn_totp.setMaximumHeight(32)
+                btn_totp.setStyleSheet(
+                    "QPushButton { font-size:11px; padding:4px; }"
+                )
+                
+                btn_label = "🟢 Disable" if user["active"] else "🔴 Enable"
+                btn_toggle = QPushButton(btn_label)
+                btn_toggle.setMaximumWidth(110)
+                btn_toggle.setMinimumHeight(32)
+                btn_toggle.setMaximumHeight(32)
+                btn_toggle.setStyleSheet(
+                    "QPushButton { font-size:11px; padding:4px; }"
+                )
+                
+                btn_delete = QPushButton("🗑 Delete")
+                btn_delete.setMaximumWidth(90)
+                btn_delete.setMinimumHeight(32)
+                btn_delete.setMaximumHeight(32)
+                btn_delete.setProperty("role", "danger")
+                btn_delete.setStyleSheet(
+                    "QPushButton { font-size:11px; padding:4px; color:#f38ba8; border-color:#f38ba8; }"
+                    "QPushButton:hover { background-color:#3d1f27; }"
+                )
+
+                btn_totp.clicked.connect(lambda checked, u=user["username"]: self._show_user_totp(u))
+                btn_toggle.clicked.connect(lambda checked, u=user["username"]: self._toggle_user(u))
+                btn_delete.clicked.connect(lambda checked, u=user["username"]: self._delete_user(u))
+
+                actions_layout.addWidget(btn_totp)
+                actions_layout.addWidget(btn_toggle)
+                actions_layout.addWidget(btn_delete)
+                actions_layout.addStretch()
+
+                self.tbl_users.setCellWidget(row, 5, actions_widget)
+                self.tbl_users.setRowHeight(row, 50)  # Set row height for all rows
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load users: {e}")
+
+    def _show_user_totp(self, username: str):
+        """Admin: Show user's TOTP secret"""
+        try:
+            result = self.auth_manager.get_user_totp_secret(
+                self.session_token, username
+            )
+            if not result:
+                QMessageBox.warning(self, "Error", f"Could not retrieve TOTP for {username}")
+                return
+
+            hex_secret, base32_secret = result
+            QMessageBox.information(
+                self, f"TOTP Secret for {username}",
+                f"Base32: {base32_secret}\n\n"
+                f"Share this with user to add to Google Authenticator"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def _toggle_user(self, username: str):
+        """Admin: Enable/Disable user"""
+        try:
+            user = self.auth_manager._users.get(username)
+            if not user:
+                return
+
+            if user.active:
+                # Disable
+                success = self.auth_manager.disable_user(self.session_token, username)
+                msg = f"User {username} disabled"
+            else:
+                # Enable
+                success = self.auth_manager.enable_user(self.session_token, username)
+                msg = f"User {username} enabled"
+
+            if success:
+                QMessageBox.information(self, "Success", f"✅ {msg}")
+                self._refresh_user_list()
+            else:
+                QMessageBox.warning(self, "Error", "Operation failed")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+    def _delete_user(self, username: str):
+        """Admin: Delete user (with confirmation)"""
+        if username == self.current_username:
+            QMessageBox.warning(self, "Error", "Cannot delete your own account")
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Delete user '{username}'?\n\nThis cannot be undone!",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                success = self.auth_manager.delete_user(self.session_token, username)
+                if success:
+                    QMessageBox.information(self, "Deleted", f"User '{username}' deleted")
+                    self._refresh_user_list()
+                else:
+                    QMessageBox.warning(self, "Error", "Failed to delete user")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main Window
 # ──────────────────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, auth_manager=None, session_token=None, username=None):
         super().__init__()
+        self.auth_manager = auth_manager
+        self.session_token = session_token
+        self.current_username = username
         self.start_time = time.time()
         self.bridge = SignalBridge()
         self.log_handler = QtLogHandler()
@@ -1828,6 +2330,13 @@ class MainWindow(QMainWindow):
         self._init_tabs()
         self._init_status_bar()
         self._init_timers()
+
+        # Set auth context on user management tab
+        if auth_manager and session_token and username:
+            users = auth_manager.get_all_users()
+            user_role = next((u.get("role", "user") for u in users if u.get("username") == username), "user")
+            self.tab_users.set_auth_context(auth_manager, session_token, username, user_role)
+
         self.logger.info("%s v%s started", Settings.APP_NAME, Settings.APP_VERSION)
 
     def _init_window(self):
@@ -1848,6 +2357,7 @@ class MainWindow(QMainWindow):
         self.tab_crypto        = CryptoToolsTab()
         self.tab_keys          = KeyManagerTab(self.bridge)
         self.tab_logs          = LogsTab(self.log_handler)
+        self.tab_users         = UserManagementTab(self.bridge)
 
         for tab, label in [
             (self.tab_dashboard,     "⚡ Dashboard"),
@@ -1858,6 +2368,7 @@ class MainWindow(QMainWindow):
             (self.tab_crypto,        "🔐 Crypto Tools"),
             (self.tab_keys,          "🗝 Key Manager"),
             (self.tab_logs,          "📋 Logs"),
+            (self.tab_users,         "👥 User Management"),
         ]:
             self.tabs.addTab(tab, label)
 
@@ -1930,14 +2441,114 @@ class MainWindow(QMainWindow):
 
 def main():
     os.makedirs(Settings.KEYS_DIR, exist_ok=True)
+
     app = QApplication(sys.argv)
     app.setApplicationName(Settings.APP_NAME)
     app.setApplicationVersion(Settings.APP_VERSION)
     app.setStyleSheet(STYLE_SHEET)
-    window = MainWindow()
+
+    # ── Zero Trust: Authenticate before showing main window ──
+    auth_db_path  = os.path.join(Settings.BASE_DIR, "auth_db.enc")
+    master_key_env = os.environ.get("SC_MASTER_KEY", "")
+
+    auth_manager = ZeroTrustLoginManager(auth_db_path)
+
+    # Use env var or prompt for master key
+    if master_key_env:
+        import hashlib
+        mk = hashlib.sha256(master_key_env.encode()).digest()
+        auth_manager.set_master_key_from_bytes(mk)
+    else:
+        # First run: derive master key from a simple prompt
+        from PyQt6.QtWidgets import QInputDialog, QLineEdit
+        master_pw, ok = QInputDialog.getText(
+            None,
+            "SecureCrypt — Master Key",
+            "Enter MASTER password to decrypt user database:\n"
+            "(Use same password every time you start the app)",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not master_pw:
+            sys.exit(0)
+
+        import hashlib
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes as _hashes
+        kdf = PBKDF2HMAC(
+            algorithm=_hashes.SHA256(),
+            length=32,
+            salt=b"securecrypt-master-salt-v1",
+            iterations=100_000,
+        )
+        mk = kdf.derive(master_pw.encode())
+        auth_manager.set_master_key_from_bytes(mk)
+
+    # Reload users after master key is set (important!)
+    auth_manager._load_users()
+
+    # Auto-create default admin if no users exist
+    if auth_manager.user_count() == 0:
+        from auth.login_system import TOTP, format_totp_display, generate_otpauth_uri
+        try:
+            default_secret = auth_manager.register_user(
+                "admin", "SecureCrypt@Admin123", role="admin"
+            )
+            totp = TOTP(default_secret)
+            current_code = totp.now()
+            base32_secret = format_totp_display(default_secret)
+            otpauth_uri = generate_otpauth_uri("admin", default_secret, issuer="SecureCrypt")
+            
+            QMessageBox.information(
+                None,
+                "✅ First Run — Default Admin Created",
+                f"✓ Default admin account created!\n\n"
+                f"📝 USER CREDENTIALS:\n"
+                f"  Username:  admin\n"
+                f"  Password:  SecureCrypt@Admin123\n\n"
+                f"🔐 TOTP SETUP (Required for login):\n"
+                f"  Current 6-digit code: {current_code}\n"
+                f"  Base32 Secret (for Google Authenticator): {base32_secret}\n\n"
+                f"📱 HOW TO ADD TO AUTHENTICATOR APP:\n"
+                f"  OPTION 1 - Manual Entry (if QR code fails):\n"
+                f"    1. Open Google Authenticator / Authy app\n"
+                f"    2. Click '+' (add account)\n"
+                f"    3. Select 'Enter setup key' (or 'Manual entry')\n"
+                f"    4. Paste this: {base32_secret}\n"
+                f"    5. Set key type to 'Time based' or 'TOTP'\n"
+                f"    6. Click 'Add' → Done!\n\n"
+                f"  OPTION 2 - QR Code:\n"
+                f"    1. Open Google Authenticator app\n"
+                f"    2. Click '+' (add account)\n"
+                f"    3. Scan this URI: {otpauth_uri}\n\n"
+                f"⚠️  IMPORTANT:\n"
+                f"  • Verify the current code matches your app ({current_code})\n"
+                f"  • Save the secret above in a password manager\n"
+                f"  • REQUIRED: Enter 6-digit code from app to login\n"
+                f"  • Change password after first successful login",
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                None,
+                "❌ Setup Failed",
+                f"Could not create default admin:\n{e}\n\n"
+                f"Try deleting {auth_db_path} and restart.",
+            )
+            sys.exit(1)
+
+    # Show login dialog
+    login_dlg = LoginDialog(auth_manager)
+    if login_dlg.exec() != QDialog.DialogCode.Accepted:
+        sys.exit(0)
+
+    token    = login_dlg.token
+    username = login_dlg.username_result
+
+    # ── Launch main window ────────────────────────────────────
+    window = MainWindow(auth_manager=auth_manager,
+                        session_token=token,
+                        username=username)
     window.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
